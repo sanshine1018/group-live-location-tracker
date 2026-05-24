@@ -16,3 +16,5 @@ __pycache__/
 *.db
 
 firebase_key.json
+
+.streamlit/secrets.toml

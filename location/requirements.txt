@@ -3,3 +3,5 @@ streamlit-geolocation
 streamlit-folium
 folium
 firebase-admin
+python-dotenv
+supabase

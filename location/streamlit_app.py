@@ -39,15 +39,17 @@ Always obtain informed consent from users before requesting their
 precise location.
 """
 
+from unicodedata import name
+
 import streamlit as st
 from streamlit_geolocation import streamlit_geolocation
 from streamlit_folium import st_folium
 import folium
 from datetime import datetime
-import sqlite3
-import os
+from supabase import create_client, Client
 import secrets
 import uuid
+import math
 
 ###############################################################################
 # Database helpers
@@ -55,120 +57,116 @@ import uuid
 
 DB_PATH = "group_tracker.db"
 
+#### marker color ####
+COLORS = ["red", "blue", "green", "purple", "orange", "darkred", "cadetblue"]
 
-def init_db(path: str = DB_PATH) -> sqlite3.Connection:
-    """Initialize the SQLite database and create tables if they don't exist.
+@st.cache_resource
+def get_supabase_client():
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
 
-    Returns a database connection.  Tables created:
+supabase = get_supabase_client()
 
-    * groups: id (TEXT primary key), name (TEXT), created_at (TEXT)
-    * users: id (INTEGER primary key autoincrement), name (TEXT), group_id (TEXT)
-    * positions: user_id (INTEGER), latitude (REAL), longitude (REAL),
-      timestamp (TEXT)
-    """
-    conn = sqlite3.connect(path, check_same_thread=False)
-    cur = conn.cursor()
-    # Groups table
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS groups (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-        """
+def get_user_color(user_id):
+    return COLORS[user_id % len(COLORS)]
+
+#### distance calculation ####
+
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(dlon / 2) ** 2
     )
-    # Users table
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            group_id TEXT NOT NULL,
-            FOREIGN KEY(group_id) REFERENCES groups(id)
-        )
-        """
-    )
-    # Positions table
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS positions (
-            user_id INTEGER PRIMARY KEY,
-            latitude REAL,
-            longitude REAL,
-            timestamp TEXT,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )
-        """
-    )
-    conn.commit()
-    return conn
+
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-def get_or_create_group(conn: sqlite3.Connection, group_name: str) -> str:
-    """Return the group ID for the given group name, creating it if needed."""
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM groups WHERE name = ?", (group_name,))
-    row = cur.fetchone()
-    if row:
-        return row[0]
-    # Create a new group with a random ID
-    group_id = secrets.token_hex(4)  # 8‑character hex ID
-    created_at = datetime.utcnow().isoformat()
-    cur.execute(
-        "INSERT INTO groups (id, name, created_at) VALUES (?, ?, ?)",
-        (group_id, group_name, created_at),
-    )
-    conn.commit()
+
+def get_or_create_group(group_name: str)-> str:
+    response = supabase.table("groups").select("id").eq("name", group_name).execute()
+    if response.data:
+        return response.data[0]["id"]
+    group_id = secrets.token_hex(4)
+
+    supabase.table("groups").insert({"id": group_id, "name": group_name}).execute()
     return group_id
 
-
-def register_user(conn: sqlite3.Connection, user_name: str, group_id: str) -> int:
-    """Add a user to a group and return the new user_id.
-
-    If the user already exists in the same group, return the existing ID.
-    """
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id FROM users WHERE name = ? AND group_id = ?", (user_name, group_id)
+def register_user(user_name: str, group_id: str) -> int:
+    result = (
+        supabase.table("users")
+        .select("id")
+        .eq("name", user_name)
+        .eq("group_id", group_id)
+        .execute()
     )
-    row = cur.fetchone()
-    if row:
-        return row[0]
-    cur.execute(
-        "INSERT INTO users (name, group_id) VALUES (?, ?)", (user_name, group_id)
+
+    if result.data:
+        return result.data[0]["id"]
+
+    insert_result = supabase.table("users").insert({
+        "name": user_name,
+        "group_id": group_id,
+        "color": None
+    }).execute()
+
+    user_id = insert_result.data[0]["id"]
+    color = get_user_color(user_id)
+
+    supabase.table("users").update({
+        "color": color
+    }).eq("id", user_id).execute()
+
+    return user_id
+
+
+def update_position(user_id: int, latitude: float, longitude: float):
+    supabase.table("positions").upsert({
+        "user_id": user_id,
+        "latitude": latitude,
+        "longitude": longitude,
+        "timestamp": datetime.utcnow().isoformat()
+    }).execute()
+
+
+def get_group_positions(group_id: str):
+    result = (
+        supabase.table("users")
+        .select("id, name, color, positions(latitude, longitude, timestamp)")
+        .eq("group_id", group_id)
+        .execute()
     )
-    conn.commit()
-    return cur.lastrowid
+
+    return result.data
 
 
-def update_position(
-    conn: sqlite3.Connection, user_id: int, latitude: float, longitude: float
-) -> None:
-    """Update the user’s current position (upsert)."""
-    cur = conn.cursor()
-    timestamp = datetime.utcnow().isoformat()
-    cur.execute(
-        "INSERT OR REPLACE INTO positions (user_id, latitude, longitude, timestamp)"
-        " VALUES (?, ?, ?, ?)",
-        (user_id, latitude, longitude, timestamp),
+def set_destination(group_id: str, name: str, latitude: float, longitude: float):
+    supabase.table("destinations").upsert({
+        "group_id": group_id,
+        "name": name,
+        "latitude": latitude,
+        "longitude": longitude
+    }).execute()
+
+
+def get_destination(group_id: str):
+    result = (
+        supabase.table("destinations")
+        .select("*")
+        .eq("group_id", group_id)
+        .execute()
     )
-    conn.commit()
+
+    return result.data[0] if result.data else None
 
 
-def get_group_positions(conn: sqlite3.Connection, group_id: str):
-    """Return a list of (user_name, latitude, longitude, timestamp) for a group."""
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT users.name, positions.latitude, positions.longitude, positions.timestamp
-        FROM users
-        LEFT JOIN positions ON users.id = positions.user_id
-        WHERE users.group_id = ?
-        """,
-        (group_id,),
-    )
-    return cur.fetchall()
+
 
 
 ###############################################################################
@@ -177,134 +175,338 @@ def get_group_positions(conn: sqlite3.Connection, group_id: str):
 
 def main():
     """Main entry point for the Streamlit app."""
-    st.set_page_config(page_title="Group Live Location Tracker", layout="wide")
+
+    st.set_page_config(
+        page_title="Group Live Location Tracker",
+        layout="wide"
+    )
+
     st.title("🚶 Group Live Location Tracker")
 
-    # Disclaimer about privacy
-    with st.expander("Privacy Notice", expanded=False):
-        st.markdown(
-            """
-            **Precise location data is sensitive.**  By using this demo you
-            consent to share your location with other members of your group.  The
-            Future of Privacy Forum notes that location data is treated as
-            legally sensitive in most jurisdictions, and that data should only
-            be collected for a specific purpose and not re‑used for other
-            purposes【781875655076457†L107-L116】.  This app stores your location
-            only temporarily for demonstration purposes.
-            """
-        )
+    # =========================
+    # JOIN / CREATE GROUP
+    # =========================
 
-    # Initialize the database
-    conn = init_db()
-
-    # If a user session exists, skip the login form
     if "user_id" not in st.session_state or "group_id" not in st.session_state:
+
         st.subheader("Join or create a group")
-        user_name = st.text_input("Your display name", max_chars=50)
-        group_name = st.text_input(
-            "Group name", help="Enter a group name to create or join"
+
+        user_name = st.text_input(
+            "Your display name",
+            max_chars=50
         )
-        if st.button("Join/Create Group", disabled=not user_name or not group_name):
-            group_id = get_or_create_group(conn, group_name)
-            user_id = register_user(conn, user_name, group_id)
+
+        group_name = st.text_input(
+            "Group name",
+            help="Enter a group name to create or join"
+        )
+
+        if st.button(
+            "Join/Create Group",
+            disabled=not user_name or not group_name
+        ):
+
+            group_id = get_or_create_group(group_name)
+
+            user_id = register_user(
+                user_name,
+                group_id
+            )
+
             st.session_state.user_id = user_id
             st.session_state.group_id = group_id
             st.session_state.user_name = user_name
+
             st.success(
-                f"Welcome, {user_name}! You have joined group '{group_name}' (ID: {group_id})."
-            )
-            st.info(
-                "Share your group ID with friends so they can join the same group."
+                f"Welcome, {user_name}! "
+                f"You joined group '{group_name}'"
             )
 
-    # If the user is registered, display location sharing interface
+            st.rerun()
+
+    # =========================
+    # MAIN APP
+    # =========================
+
     if "user_id" in st.session_state and "group_id" in st.session_state:
+
         group_id = st.session_state.group_id
         user_id = st.session_state.user_id
         user_name = st.session_state.user_name
 
-        st.write(f"**Group ID:** `{group_id}`  (share this with friends to join)")
-        st.write(f"Logged in as **{user_name}**")
+        st.write(f"### Logged in as {user_name}")
+        st.write(f"**Group ID:** `{group_id}`")
 
-        # Capture location
+        # =========================
+        # LOCATION UPDATE
+        # =========================
+
         st.markdown("### Share your location")
-        # Use the streamlit_geolocation component to request location
-        # The component displays a button and returns a dict when pressed.
+
         location = streamlit_geolocation()
-        # location is a dict like {"latitude": ..., "longitude": ..., ...}
+
         if location and location.get("latitude") is not None:
+
             lat = location["latitude"]
             lon = location["longitude"]
-            update_position(conn, user_id, lat, lon)
+
+            update_position(
+                user_id,
+                lat,
+                lon
+            )
+
             st.success(
-                f"Location updated: Latitude {lat:.6f}, Longitude {lon:.6f}"
-            )
-        else:
-            st.write(
-                "Click the **Get my location** button above to share your current position."
+                f"Location updated: "
+                f"{lat:.6f}, {lon:.6f}"
             )
 
-        # Auto‑refresh the page every 5 seconds to show updated positions
-         # fallback if st_autorefresh not available
-        try:
-            # Streamlit >= 1.20 provides st.autorefresh
-            from streamlit import experimental as _experimental
-            # noinspection PyUnresolvedReferences
-            _ = st.experimental_rerun
-            _ = st.experimental_rerun  # keep for lint
-        except Exception:
-            pass  # ignore if not available
-
-        # Retrieve positions for all users in the group
-        positions = get_group_positions(conn, group_id)
-        # Compose map
-        if positions:
-            # Determine central point as the average of all points
-            valid_positions = [(p[1], p[2]) for p in positions if p[1] is not None]
-            if valid_positions:
-                avg_lat = sum(p[0] for p in valid_positions) / len(valid_positions)
-                avg_lon = sum(p[1] for p in valid_positions) / len(valid_positions)
-            else:
-                # Default to Dhaka (approx.) if no coordinates yet
-                avg_lat, avg_lon = 23.8070, 90.4210
         else:
-            avg_lat, avg_lon = 23.8070, 90.4210
 
-        m = folium.Map(location=[avg_lat, avg_lon], zoom_start=14)
-        # Add markers for each position
-        for name, latitude, longitude, ts in positions:
+            st.info(
+                "Click 'Get my location' above."
+            )
+
+        # =========================
+        # GET GROUP POSITIONS
+        # =========================
+
+        positions = get_group_positions(group_id)
+
+        # =========================
+        # CALCULATE MAP CENTER
+        # =========================
+
+        valid_positions = []
+
+        for user in positions:
+
+            pos = user.get("positions")
+
+            if (
+                pos
+                and pos.get("latitude") is not None
+                and pos.get("longitude") is not None
+            ):
+
+                valid_positions.append(
+                    (
+                        pos["latitude"],
+                        pos["longitude"]
+                    )
+                )
+
+        if valid_positions:
+
+            avg_lat = (
+                sum(p[0] for p in valid_positions)
+                / len(valid_positions)
+            )
+
+            avg_lon = (
+                sum(p[1] for p in valid_positions)
+                / len(valid_positions)
+            )
+
+        else:
+
+            avg_lat = 23.8070
+            avg_lon = 90.4210
+
+        # =========================
+        # DESTINATION
+        # =========================
+
+        st.markdown("### Destination")
+
+        destination_name = st.text_input(
+            "Destination name"
+        )
+
+        dest_lat = st.number_input(
+            "Destination latitude",
+            value=23.8070,
+            format="%.6f"
+        )
+
+        dest_lon = st.number_input(
+            "Destination longitude",
+            value=90.4210,
+            format="%.6f"
+        )
+
+        if st.button("Set Destination"):
+
+            set_destination(
+                group_id,
+                destination_name,
+                dest_lat,
+                dest_lon
+            )
+
+            st.success("Destination updated")
+
+        destination = get_destination(group_id)
+
+        # =========================
+        # CREATE MAP
+        # =========================
+
+        m = folium.Map(
+            location=[avg_lat, avg_lon],
+            zoom_start=14
+        )
+
+        # =========================
+        # DESTINATION MARKER
+        # =========================
+
+        if destination:
+
+            folium.Marker(
+                [
+                    destination["latitude"],
+                    destination["longitude"]
+                ],
+                popup=f"Destination: {destination['name']}",
+                tooltip="Destination",
+                icon=folium.Icon(
+                    color="red",
+                    icon="flag"
+                )
+            ).add_to(m)
+
+        # =========================
+        # USER MARKERS
+        # =========================
+
+        for user in positions:
+
+            pos = user.get("positions")
+
+            if not pos:
+                continue
+
+            latitude = pos.get("latitude")
+            longitude = pos.get("longitude")
+            ts = pos.get("timestamp")
+
             if latitude is None or longitude is None:
                 continue
-            last_seen = datetime.fromisoformat(ts).strftime("%Y‑%m‑%d %H:%M:%S")
+
+            name = user["name"]
+            color = user.get("color") or "blue"
+
+            pos = user.get("positions")
+            timestamp = pos.get("timestamp") if pos else None
+
+            if timestamp:
+                try:
+                    last_seen = datetime.fromisoformat(timestamp)
+                except:
+                    last_seen = datetime.strptime(
+                    timestamp.split(".")[0],
+                    "%Y-%m-%dT%H:%M:%S"
+                    )
+            else:
+                last_seen = "Unknown"
+
+            popup_text = f"""
+            <b>{name}</b><br>
+            Last seen: {last_seen}
+            """
+            
+            # =========================
+            # ETA
+            # =========================
+
+            if destination:
+
+                distance_km = haversine(
+                    latitude,
+                    longitude,
+                    destination["latitude"],
+                    destination["longitude"]
+                )
+
+                eta_min = (
+                    distance_km / 5
+                ) * 60
+
+                popup_text += f"""
+                <br>Distance: {distance_km:.2f} km
+                <br>ETA walking: {eta_min:.0f} min
+                """
+
             folium.Marker(
                 [latitude, longitude],
-                popup=f"{name} (last seen {last_seen} UTC)",
+                popup=popup_text,
                 tooltip=name,
-                icon=folium.Icon(color="blue", icon="user")
+                icon=folium.Icon(
+                    color=color,
+                    icon="user"
+                )
             ).add_to(m)
-        # Render map in Streamlit
-        st.write("### Group Members' Locations")
-        st_folium(m, width=700, height=500)
 
-        # Display table of group members and their last seen times
+        # =========================
+        # SHOW MAP
+        # =========================
+
+        st.write("### Group Members' Locations")
+
+        st_folium(
+            m,
+            width=1200,
+            height=700
+        )
+
+        # =========================
+        # MEMBER TABLE
+        # =========================
+
         if positions:
+
             st.write("### Member List")
-            # Build a simple table
+
             table_data = []
-            for name, latitude, longitude, ts in positions:
-                last_seen = ts
+
+            for user in positions:
+
+                pos = user.get("positions")
+
+                latitude = (
+                    pos.get("latitude")
+                    if pos else None
+                )
+
+                longitude = (
+                    pos.get("longitude")
+                    if pos else None
+                )
+
+                ts = (
+                    pos.get("timestamp")
+                    if pos else None
+                )
+
                 table_data.append({
-                    "Name": name,
-                    "Latitude": f"{latitude:.6f}" if latitude else "–",
-                    "Longitude": f"{longitude:.6f}" if longitude else "–",
-                    "Last update": last_seen.replace("T", " ") if last_seen else "–",
+                    "Name": user["name"],
+                    "Latitude": (
+                        f"{latitude:.6f}"
+                        if latitude else "–"
+                    ),
+                    "Longitude": (
+                        f"{longitude:.6f}"
+                        if longitude else "–"
+                    ),
+                    "Last update": (
+                        ts.replace("T", " ")
+                        if ts else "–"
+                    ),
                 })
+
             st.table(table_data)
 
 
 if __name__ == "__main__":
-    # Ensure database directory exists
-    if not os.path.exists(DB_PATH):
-        # Create an empty file to ensure relative directory exists
-        open(DB_PATH, "a").close()
     main()
